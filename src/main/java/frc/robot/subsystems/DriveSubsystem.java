@@ -8,6 +8,9 @@ import com.pathplanner.lib.auto.AutoBuilder;
 import com.pathplanner.lib.config.PIDConstants;
 import com.pathplanner.lib.config.RobotConfig;
 import com.pathplanner.lib.controllers.PPHolonomicDriveController;
+import com.pathplanner.lib.util.DriveFeedforwards;
+import com.pathplanner.lib.util.swerve.SwerveSetpoint;
+import com.pathplanner.lib.util.swerve.SwerveSetpointGenerator;
 import com.studica.frc.AHRS;
 
 import edu.wpi.first.math.geometry.Pose2d;
@@ -61,6 +64,10 @@ public class DriveSubsystem extends SubsystemBase {
           m_rearLeft.getPosition(),
           m_rearRight.getPosition()});
 
+  // Setpoint generator for PathPlanner
+  private final SwerveSetpointGenerator setpointGenerator;
+  private SwerveSetpoint previousSetpoint;
+
   /** Creates a new DriveSubsystem. */
   public DriveSubsystem() {
 
@@ -72,14 +79,20 @@ public class DriveSubsystem extends SubsystemBase {
       e.printStackTrace();
     }
 
-    if(robotConfig == null) return;
+    // Reset the gyro on a seperate thread after waiting a second for it to calibrate
+    new Thread(() -> {
+      try {
+        Thread.sleep(1000);
+        m_gyro.reset();
+      } catch (Exception e) {}
+    }).start();
     
     /* 
-     *    Auto Builder Configuration
+     *    Auto Builder & Path Planner Configuration
      */
     AutoBuilder.configure(this::getPose, this::resetOdometry, this::getRobotRelativeSpeeds,
-     (speeds, feedforwards) -> drive(speeds), 
-     new PPHolonomicDriveController(
+      (speeds, feedforwards) -> drive(speeds), 
+      new PPHolonomicDriveController(
       new PIDConstants(AutoConstants.kPXController, 0, 0), 
       new PIDConstants(AutoConstants.kPThetaController, 0, 0)), 
       robotConfig,  () -> {
@@ -95,14 +108,16 @@ public class DriveSubsystem extends SubsystemBase {
       }, 
       this);
 
-      // Reset the gyro on a seperate thread after waiting a second for it to calibrate
-      new Thread(() -> {
-        try {
-            Thread.sleep(1000);
-            m_gyro.reset();
-        } catch (Exception e) {}
-    }).start();
+    // Set up for being able to drive using robot-relative ChassisSpeeds
+    setpointGenerator = new SwerveSetpointGenerator(
+      robotConfig, // The robot configuration. This is the same config used for generating trajectories and running path following commands.
+      DriveConstants.kMaxAngularSpeed // The max rotation velocity of a swerve module in radians per second.
+      );
 
+    // Initialize the previous setpoint to the robot's current speeds & module states
+    ChassisSpeeds currentSpeeds = getRobotRelativeSpeeds(); // Method to get current robot-relative chassis speeds
+    SwerveModuleState[] currentStates = getCurrentModuleStates(); // Method to get the current swerve module states
+    previousSetpoint = new SwerveSetpoint(currentSpeeds, currentStates, DriveFeedforwards.zeros(robotConfig.numModules));
   }
 
   @Override
@@ -187,18 +202,20 @@ public class DriveSubsystem extends SubsystemBase {
   }
 
   /**
-   * Method to drive the robot given robot relative ChassisSpeeds.
-   *
-   * @param speeds Desired ChassisSpeeds of the robot
-   */
+    * This method will take in desired robot-relative chassis speeds,
+    * generate a swerve setpoint, then set the target state for each module
+    *
+    * @param speeds The desired robot-relative speeds
+    */
   public void drive(ChassisSpeeds speeds) {
-
-    SwerveModuleState [] swerveModuleStates = DriveConstants.kDriveKinematics.toSwerveModuleStates(speeds);
-    SwerveDriveKinematics.desaturateWheelSpeeds(swerveModuleStates, DriveConstants.kMaxSpeedMetersPerSecond);
-    m_frontLeft.setDesiredState(swerveModuleStates[0]);
-    m_frontRight.setDesiredState(swerveModuleStates[1]);
-    m_rearLeft.setDesiredState(swerveModuleStates[2]);
-    m_rearRight.setDesiredState(swerveModuleStates[3]);
+    // Note: it is important to not discretize speeds before or after
+    // using the setpoint generator, as it will discretize them for you
+    previousSetpoint = setpointGenerator.generateSetpoint(
+      previousSetpoint, // The previous setpoint
+      speeds, // The desired target speeds
+      0.02 // The loop time of the robot code, in seconds
+    );
+    setModuleStates(previousSetpoint.moduleStates()); // Method that will drive the robot given target module states
   }
 
   /** Sets the wheels into an X formation to prevent movement. */
@@ -255,5 +272,19 @@ public class DriveSubsystem extends SubsystemBase {
    */
   public double getTurnRate() {
     return -1 * m_gyro.getRate() * (DriveConstants.kGyroReversed ? -1.0 : 1.0);
+  }
+
+  /**
+   * Returns the current Swerve Module States of the robot
+   *
+   * @return The Swerve Module States of the robot
+   */
+  public SwerveModuleState [] getCurrentModuleStates() {
+    SwerveModuleState [] states = new SwerveModuleState[4];
+    states[0] = m_frontLeft.getState();
+    states[1] = m_frontRight.getState();
+    states[2] = m_rearLeft.getState();
+    states[3] = m_rearRight.getState();
+    return states;
   }
 }
